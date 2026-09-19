@@ -96,6 +96,17 @@ enum Kind {
     Answer,
 }
 
+/// A turn of a conversation, as a transcript of it keeps them: what the
+/// user said; what the model replied, as the text it showed and the tool
+/// calls it made as written, without the thought behind them; and what the
+/// tools returned.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Turn {
+    User(String),
+    Reply { text: String, calls: Vec<String> },
+    Results(Vec<String>),
+}
+
 /// A piece of the model's reply, as it is generated.
 pub enum Chunk<'a> {
     /// Part of the model's thought, before it replies.
@@ -180,16 +191,56 @@ impl<M: LanguageModel> Chat<M> {
     /// its tokens the model has read so far, out of how many, as it goes.
     /// Tags in the prompt, such as `<tool_call>`, are encoded as special
     /// tokens.
-    pub fn system(&mut self, text: &str, mut on_progress: impl FnMut(usize, usize)) -> Result<()> {
+    pub fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
         if self.len != 0 {
             return Err("the conversation has already started".into());
         }
         let content = self.tokenizer.encode_with_special(text)?;
         let turn = self.turn("system", content)?;
-        on_progress(0, turn.len());
-        for (i, batch) in turn.chunks(BATCH).enumerate() {
+        self.read(&turn, on_progress)
+    }
+
+    /// Forgets the conversation, so that a system prompt or a saved state
+    /// can open another.
+    pub fn clear(&mut self) {
+        self.model.reset();
+        self.len = 0;
+    }
+
+    /// Feeds `turns` to the model as the conversation so far, reporting
+    /// progress as `system` does, without a reply to them. A reply is
+    /// written as the chat template writes a reply already made, with an
+    /// empty thought before it, as the template leaves earlier thoughts
+    /// out when it writes a conversation over.
+    pub fn replay(&mut self, turns: &[Turn], on_progress: impl FnMut(usize, usize)) -> Result<()> {
+        let mut tokens = Vec::new();
+        for turn in turns {
+            tokens.extend(match turn {
+                Turn::User(message) => self.user(message)?,
+                Turn::Reply { text, calls } => self.reply(text, calls)?,
+                Turn::Results(outputs) => self.results(outputs)?,
+            });
+        }
+        self.read(&tokens, on_progress)
+    }
+
+    /// Number of tokens `turn` takes when fed, as `replay` writes it.
+    pub fn measure(&self, turn: &Turn) -> Result<usize> {
+        Ok(match turn {
+            Turn::User(message) => self.user(message)?,
+            Turn::Reply { text, calls } => self.reply(text, calls)?,
+            Turn::Results(outputs) => self.results(outputs)?,
+        }
+        .len())
+    }
+
+    /// Feeds `tokens` a batch at a time, reporting how many so far, out of
+    /// how many, as it goes.
+    fn read(&mut self, tokens: &[u32], mut on_progress: impl FnMut(usize, usize)) -> Result<()> {
+        on_progress(0, tokens.len());
+        for (i, batch) in tokens.chunks(BATCH).enumerate() {
             self.feed(batch, Kind::Prompt)?;
-            on_progress(i * BATCH + batch.len(), turn.len());
+            on_progress(i * BATCH + batch.len(), tokens.len());
         }
         Ok(())
     }
@@ -232,8 +283,7 @@ impl<M: LanguageModel> Chat<M> {
         message: &str,
         on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Vec<String>> {
-        let content = self.tokenizer.encode(message)?;
-        let turn = self.turn("user", content)?;
+        let turn = self.user(message)?;
         self.feed(&turn, Kind::Prompt)?;
         self.generate(on_chunk)
     }
@@ -247,6 +297,19 @@ impl<M: LanguageModel> Chat<M> {
         outputs: &[String],
         on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Vec<String>> {
+        let turn = self.results(outputs)?;
+        self.feed(&turn, Kind::Prompt)?;
+        self.generate(on_chunk)
+    }
+
+    /// A message from the user as a turn.
+    fn user(&self, message: &str) -> Result<Vec<u32>> {
+        let content = self.tokenizer.encode(message)?;
+        self.turn("user", content)
+    }
+
+    /// The results of tool calls as a turn: a `<tool_response>` block each.
+    fn results(&self, outputs: &[String]) -> Result<Vec<u32>> {
         let mut content = Vec::new();
         for (i, output) in outputs.iter().enumerate() {
             if i > 0 {
@@ -256,9 +319,25 @@ impl<M: LanguageModel> Chat<M> {
             content.extend(self.tokenizer.encode(&format!("\n{output}\n"))?);
             content.extend(&self.tool_response_end);
         }
-        let turn = self.turn("user", content)?;
-        self.feed(&turn, Kind::Prompt)?;
-        self.generate(on_chunk)
+        self.turn("user", content)
+    }
+
+    /// A reply already made as a turn: an empty thought, its text, and its
+    /// tool calls as written, each in a `<tool_call>` block.
+    fn reply(&self, text: &str, calls: &[String]) -> Result<Vec<u32>> {
+        let mut content = vec![self.think];
+        content.extend(self.tokenizer.encode("\n\n")?);
+        content.push(self.think_end);
+        content.extend(self.tokenizer.encode(&format!("\n\n{text}"))?);
+        for (i, call) in calls.iter().enumerate() {
+            if i > 0 {
+                content.extend(self.tokenizer.encode("\n")?);
+            }
+            content.push(self.tool_call);
+            content.extend(self.tokenizer.encode(call)?);
+            content.push(self.tool_call_end);
+        }
+        self.turn("assistant", content)
     }
 
     /// Encodes a turn of the conversation around its content's tokens.
@@ -565,6 +644,65 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(chat.model.fed, expected);
+    }
+
+    #[test]
+    fn replays_a_transcript_without_thoughts() {
+        let call = "\n<function=bash>\n<parameter=command>\ndate\n</parameter>\n</function>\n";
+        let mut chat = chat(&["First.\n</think>\n\nOne.", "Later.\n</think>\n\nAnother."]);
+        chat.send("first", |_| ControlFlow::Continue(())).unwrap();
+        chat.clear();
+        assert_eq!(chat.tokens(), 0);
+        chat.system("Be brief.", |_, _| {}).unwrap();
+        let turns = [
+            Turn::User("date?".to_string()),
+            Turn::Reply {
+                text: "Checking.\n\n".to_string(),
+                calls: vec![call.to_string()],
+            },
+            Turn::Results(vec!["Mon".to_string()]),
+            Turn::Reply {
+                text: "Monday.".to_string(),
+                calls: Vec::new(),
+            },
+        ];
+        let mut progress = Vec::new();
+        chat.replay(&turns, |read, total| progress.push((read, total)))
+            .unwrap();
+        let expected = chat
+            .tokenizer
+            .encode_with_special(&format!(
+                "<|im_start|>system\nBe brief.<|im_end|>\n\
+                 <|im_start|>user\ndate?<|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n\n</think>\n\nChecking.\n\n<tool_call>{call}</tool_call><|im_end|>\n\
+                 <|im_start|>user\n<tool_response>\nMon\n</tool_response><|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n\n</think>\n\nMonday.<|im_end|>\n"
+            ))
+            .unwrap();
+        assert_eq!(chat.model.fed, expected);
+        assert_eq!(chat.tokens(), expected.len());
+        let system = chat
+            .tokenizer
+            .encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n")
+            .unwrap()
+            .len();
+        assert_eq!(progress.first().unwrap().0, 0);
+        assert_eq!(
+            progress.last().unwrap(),
+            &(expected.len() - system, progress.last().unwrap().1)
+        );
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| chat.measure(turn).unwrap())
+                .sum::<usize>(),
+            expected.len() - system
+        );
+
+        // The conversation goes on from the replayed turns.
+        let mut reply = String::new();
+        chat.send("and?", text(&mut reply)).unwrap();
+        assert_eq!(reply.trim(), "Another.");
     }
 
     #[test]

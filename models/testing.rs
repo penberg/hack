@@ -17,9 +17,10 @@ pub struct Scripted {
     /// What is left of the reply being said.
     saying: VecDeque<u32>,
     vocab: usize,
-    think: u32,
-    think_end: u32,
-    newline: u32,
+    /// How the chat template opens a reply, with the thought open or with
+    /// an empty one when the reply is to be made without thinking.
+    opening: Vec<u32>,
+    unthinking: Vec<u32>,
     end: u32,
     max_len: usize,
 }
@@ -37,9 +38,12 @@ impl Scripted {
                 .collect(),
             saying: VecDeque::new(),
             vocab: tokenizer.vocab_size(),
-            think: tokenizer.special("<think>").unwrap(),
-            think_end: tokenizer.special("</think>").unwrap(),
-            newline: tokenizer.encode("\n").unwrap()[0],
+            opening: tokenizer
+                .encode_with_special("<|im_start|>assistant\n<think>\n")
+                .unwrap(),
+            unthinking: tokenizer
+                .encode_with_special("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                .unwrap(),
             end: tokenizer.special("<|im_end|>").unwrap(),
             max_len,
         }
@@ -58,13 +62,11 @@ impl LanguageModel for Scripted {
             "tokens past the end of the context"
         );
         self.fed.extend(tokens);
-        // The reply's prompt ends with `<think>\n`, or with an empty
-        // thought when the reply is to be made without one; a sampled token
-        // comes alone.
-        let opened = tokens.len() > 1 && tokens.ends_with(&[self.think, self.newline]);
-        let no_thought =
-            tokens.len() > 1 && tokens.ends_with(&[self.think_end, self.newline, self.newline]);
-        if opened || no_thought {
+        // A reply's prompt ends with the template's opening of one; a
+        // sampled token comes alone.
+        if tokens.len() > 1
+            && (self.fed.ends_with(&self.opening) || self.fed.ends_with(&self.unthinking))
+        {
             self.saying = self.scripts.pop_front().unwrap_or_default().into();
         } else if tokens.len() != 1 {
             self.saying.clear();
@@ -73,6 +75,11 @@ impl LanguageModel for Scripted {
         let mut logits = vec![0.0; self.vocab];
         logits[next as usize] = 1.0;
         logits
+    }
+
+    fn reset(&mut self) {
+        self.fed.clear();
+        self.saying.clear();
     }
 
     fn max_len(&self) -> usize {

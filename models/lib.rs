@@ -9,7 +9,7 @@ mod sampler;
 pub mod testing;
 mod tokenizer;
 
-pub use chat::{Chat, Chunk, Stats, Tally, ToolCall};
+pub use chat::{Chat, Chunk, Stats, Tally, ToolCall, Turn};
 pub use dwim_gpu::{Device, Tensor, ternary};
 pub use gguf::Gguf;
 pub use sampler::Sampler;
@@ -37,6 +37,10 @@ pub trait LanguageModel {
     /// returns the logits for the token that follows the last of them.
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32>;
 
+    /// Forgets the sequence so far, so that the next tokens start at
+    /// position 0.
+    fn reset(&mut self);
+
     /// Longest sequence the state has room for.
     fn max_len(&self) -> usize;
 }
@@ -52,6 +56,10 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         (**self).forward(tokens, pos)
+    }
+
+    fn reset(&mut self) {
+        (**self).reset()
     }
 
     fn max_len(&self) -> usize {
