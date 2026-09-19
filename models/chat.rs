@@ -432,66 +432,14 @@ impl Utf8Stream {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-
     use super::*;
-
-    /// A model that says what it is told to: it records every token fed to
-    /// it, and each time the chat template opens a reply for it, it says
-    /// the next of its scripts, then ends the reply.
-    struct Scripted {
-        fed: Vec<u32>,
-        scripts: VecDeque<Vec<u32>>,
-        /// What is left of the reply being said.
-        saying: VecDeque<u32>,
-        vocab: usize,
-        think: u32,
-        newline: u32,
-        end: u32,
-    }
-
-    impl LanguageModel for Scripted {
-        fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
-            assert_eq!(
-                pos,
-                self.fed.len(),
-                "the conversation must only append tokens"
-            );
-            self.fed.extend(tokens);
-            // The reply's prompt ends with `<think>\n`; a sampled token
-            // comes alone.
-            if tokens.len() > 1 && tokens.ends_with(&[self.think, self.newline]) {
-                self.saying = self.scripts.pop_front().unwrap_or_default().into();
-            } else if tokens.len() != 1 {
-                self.saying.clear();
-            }
-            let next = self.saying.pop_front().unwrap_or(self.end);
-            let mut logits = vec![0.0; self.vocab];
-            logits[next as usize] = 1.0;
-            logits
-        }
-
-        fn max_len(&self) -> usize {
-            1 << 16
-        }
-    }
+    use crate::testing::Scripted;
 
     /// A chat with a scripted model over the tiny vocabulary, its scripts
     /// given as text with special tokens in it.
     fn chat(scripts: &[&str]) -> Chat<Scripted> {
         let tokenizer = Tokenizer::tiny();
-        let model = Scripted {
-            fed: Vec::new(),
-            scripts: scripts
-                .iter()
-                .map(|script| tokenizer.encode_with_special(script).unwrap())
-                .collect(),
-            saying: VecDeque::new(),
-            vocab: tokenizer.vocab_size(),
-            think: tokenizer.special("<think>").unwrap(),
-            newline: tokenizer.encode("\n").unwrap()[0],
-            end: tokenizer.special("<|im_end|>").unwrap(),
-        };
+        let model = Scripted::new(&tokenizer, scripts, 1 << 16);
         let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 1)).unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
         chat

@@ -5,6 +5,8 @@ pub mod bonsai;
 mod chat;
 pub mod gguf;
 mod sampler;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 mod tokenizer;
 
 pub use chat::{Chat, Chunk, Stats, Tally, ToolCall};
