@@ -44,6 +44,12 @@ pub struct Chat<M: LanguageModel> {
     sampler: Sampler,
     /// Number of tokens in the conversation so far.
     len: usize,
+    /// Tokens of the context kept free by stopping a reply short of them.
+    reserve: usize,
+    /// Whether the last reply was stopped short for room.
+    cut: bool,
+    /// Tokens it takes to end a reply, at most.
+    ending: usize,
     im_start: u32,
     im_end: u32,
     end_of_text: u32,
@@ -180,9 +186,14 @@ impl<M: LanguageModel> Chat<M> {
             tool_call_end: tokenizer.special("</tool_call>")?,
             tool_response: tag(&tokenizer, "<tool_response>")?,
             tool_response_end: tag(&tokenizer, "</tool_response>")?,
+            // A newline, the end of the thought, two newlines, the end of
+            // the turn, and a newline.
+            ending: tokenizer.encode("\n")?.len() * 2 + tokenizer.encode("\n\n")?.len() + 2,
             tokenizer,
             sampler,
             len: 0,
+            reserve: 0,
+            cut: false,
             stats: Stats::default(),
         })
     }
@@ -250,6 +261,30 @@ impl<M: LanguageModel> Chat<M> {
         self.len
     }
 
+    /// Number of tokens the conversation has room for in all.
+    pub fn capacity(&self) -> usize {
+        self.model.max_len()
+    }
+
+    /// Keeps `tokens` of the context free: a reply stops short of them, so
+    /// that there is always room after it for a short exchange, such as
+    /// one that compacts the conversation.
+    pub fn reserve(&mut self, tokens: usize) {
+        self.reserve = tokens;
+    }
+
+    /// Whether the last reply was stopped short because the context was
+    /// full, but for the reserve.
+    pub fn cut(&self) -> bool {
+        self.cut
+    }
+
+    /// Whether a reply may go on: whether there is room for one more token
+    /// and `ending` tokens to end the reply, keeping `reserve` free.
+    fn room(&self, ending: usize, reserve: usize) -> bool {
+        self.len + 1 + ending <= self.model.max_len().saturating_sub(reserve)
+    }
+
     /// The conversation so far as the model's state, for `restore` to take
     /// up from, if the model can give it.
     pub fn save(&self) -> Option<Vec<u8>> {
@@ -286,6 +321,52 @@ impl<M: LanguageModel> Chat<M> {
         let turn = self.user(message)?;
         self.feed(&turn, Kind::Prompt)?;
         self.generate(on_chunk)
+    }
+
+    /// Sends a message from the user and has the model answer it plainly:
+    /// without thinking, without tool calls, and in at most `limit` tokens,
+    /// streaming the answer to `on_chunk` as text. Returns the answer.
+    pub fn answer(&mut self, message: &str, limit: usize, mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<String> {
+        let turn = self.user(message)?;
+        self.feed(&turn, Kind::Prompt)?;
+        // The template's opening of a reply, with the thought closed at
+        // once, as it writes a reply made without thinking.
+        let mut prompt = vec![self.im_start];
+        prompt.extend(self.tokenizer.encode("assistant\n")?);
+        prompt.push(self.think);
+        prompt.extend(self.tokenizer.encode("\n\n")?);
+        prompt.push(self.think_end);
+        prompt.extend(self.tokenizer.encode("\n\n")?);
+        let mut logits = self.feed(&prompt, Kind::Prompt)?;
+
+        let mut text = Utf8Stream::default();
+        let mut answer = String::new();
+        let mut end = vec![self.im_end];
+        end.extend(self.tokenizer.encode("\n")?);
+        // The answer is what the reserve is for, so it may use it.
+        self.cut = false;
+        for _ in 0..limit {
+            if !self.room(end.len(), 0) {
+                self.cut = true;
+                break;
+            }
+            for token in [self.think, self.think_end, self.tool_call] {
+                logits[token as usize] = f32::NEG_INFINITY;
+            }
+            let token = self.sampler.sample(&logits);
+            if token == self.im_end || token == self.end_of_text {
+                break;
+            }
+            let chunk = text.push(self.tokenizer.decode(token));
+            answer.push_str(&chunk);
+            let flow = on_chunk(Chunk::Text(&chunk));
+            logits = self.feed(&[token], Kind::Answer)?;
+            if flow.is_break() {
+                break;
+            }
+        }
+        self.feed(&end, Kind::Prompt)?;
+        Ok(answer)
     }
 
     /// Sends the results of the tool calls the last reply made, in order,
@@ -374,7 +455,16 @@ impl<M: LanguageModel> Chat<M> {
         // must write out its answer before it may end.
         let mut answering = false;
         let mut interrupted = false;
+        self.cut = false;
         loop {
+            if !self.room(self.ending, self.reserve) {
+                // The reply is stopped short, as if interrupted: what it
+                // has said stands, and what it was about to call is not
+                // run, since the results would not fit either.
+                self.cut = true;
+                interrupted = true;
+                break;
+            }
             if answering && !replied {
                 for token in [self.im_end, self.end_of_text, self.tool_call] {
                     logits[token as usize] = f32::NEG_INFINITY;
@@ -703,6 +793,63 @@ mod tests {
         let mut reply = String::new();
         chat.send("and?", text(&mut reply)).unwrap();
         assert_eq!(reply.trim(), "Another.");
+    }
+
+    #[test]
+    fn stops_a_reply_short_of_the_reserve() {
+        let tokenizer = Tokenizer::tiny();
+        let system = tokenizer.encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n").unwrap().len();
+        let user = tokenizer.encode_with_special("<|im_start|>user\ngo<|im_end|>\n<|im_start|>assistant\n<think>\n").unwrap().len();
+        // Room for the system prompt, the message, and ten tokens of
+        // reply and its ending, with a reserve of forty after that.
+        let max_len = system + user + 10 + 40;
+        let model = Scripted::new(&tokenizer, &["A long thought that goes on and on.\n</think>\n\nNever said.", "Short."], max_len);
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 1)).unwrap();
+        chat.system("Be brief.", |_, _| {}).unwrap();
+        chat.reserve(40);
+        let mut reply = String::new();
+        let calls = chat.send("go", text(&mut reply)).unwrap();
+        assert!(chat.cut());
+        assert!(calls.is_empty());
+        assert!(reply.is_empty(), "the thought never ended: {reply}");
+        assert!(chat.tokens() <= max_len - 40, "{} tokens", chat.tokens());
+        let fed = &chat.model.fed;
+        let ending = chat.tokenizer.encode_with_special("\n</think>\n\n<|im_end|>\n").unwrap();
+        assert!(fed.ends_with(&ending), "the reply is ended properly");
+
+        // The reserve is room for a plain answer, which may use it.
+        let answer = chat.answer("x", 100, |_| ControlFlow::Continue(())).unwrap();
+        assert_eq!(answer, "Short.");
+        assert!(!chat.cut());
+        assert!(chat.tokens() <= max_len);
+        // A message with no room left for even its framing is refused.
+        assert!(chat.answer("y", 100, |_| ControlFlow::Continue(())).is_err());
+    }
+
+    #[test]
+    fn answers_without_thinking_or_tools() {
+        let call = "<function=bash>\n<parameter=command>\ndate\n</parameter>\n</function>";
+        let mut chat = chat(&[&format!("Plain <tool_call>\n{call}\n</tool_call> spoken."), "One two three four five six seven eight."]);
+        let mut streamed = String::new();
+        let answer = chat.answer("sum up", 100, text(&mut streamed)).unwrap();
+        // The tool call's tags are masked, so the model says what comes
+        // after them in its script: the tags never appear.
+        assert!(!answer.contains("<tool_call>"), "{answer}");
+        assert_eq!(answer, streamed);
+        assert!(!chat.cut());
+        let expected = chat
+            .tokenizer
+            .encode_with_special("<|im_start|>user\nsum up<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+            .unwrap();
+        let start = chat.model.fed.windows(expected.len()).position(|window| window == expected).unwrap();
+        assert!(chat.model.fed[start + expected.len()..].ends_with(&[chat.im_end, chat.tokenizer.encode("\n").unwrap()[0]]));
+        assert!(chat.stats().answer.tokens > 0);
+        assert_eq!(chat.stats().thought.tokens, 0);
+
+        // An answer is cut at the limit.
+        let answer = chat.answer("again", 3, |_| ControlFlow::Continue(())).unwrap();
+        assert_eq!(chat.tokenizer.encode(&answer).unwrap().len(), 3);
+        assert_eq!(answer, "One");
     }
 
     #[test]
