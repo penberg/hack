@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use dwim_gpu::{CONV_KERNEL, HADAMARD_BLOCK};
 
-use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table, ternary};
+use crate::{Device, Gguf, LanguageModel, Result, Tensor, VERIFY, rope_table, ternary};
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -375,7 +375,12 @@ impl<D: Device> Model<D> {
         })
     }
 
-    fn forward_batch(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+    /// Runs a batch through the model. Verifying a draft, the linear layers'
+    /// recurrence runs on a scratch copy of its state and their projections
+    /// are kept, for `commit` to run the accepted tokens through the real
+    /// state, and the logits of every token come back rather than the
+    /// last's.
+    fn forward_batch(&mut self, tokens: &[u32], pos: usize, verify: bool) -> Vec<f32> {
         let c = &self.config;
         let d = &self.device;
         let s = &mut self.state;
@@ -435,6 +440,10 @@ impl<D: Device> Model<D> {
                     d.copy(&mut s.xb, 0, &s.x, 0, n * c.hidden);
                     d.rmsnorm(&mut s.xb, &layer.attn_norm, eps);
                     d.matmul(&mut s.ab, ab, &s.xb);
+                    if verify {
+                        d.copy(&mut s.stash_qkv[*slot], 0, &s.qkv, 0, n * (2 * k_dim + v_dim));
+                        d.copy(&mut s.stash_ab[*slot], 0, &s.ab, 0, n * 2 * c.v_heads);
+                    }
                     // The convolution reads the tokens before the batch from
                     // one state buffer and leaves the ones after it in the
                     // other.
@@ -443,7 +452,13 @@ impl<D: Device> Model<D> {
                     d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
                     d.l2norm(&mut s.q, c.state_dim, eps);
                     d.l2norm(&mut s.k, c.state_dim, eps);
-                    d.delta_net(&mut s.att, &s.q, &s.k, &s.v, &s.ab, decay, &mut s.ssm_state[*slot], c.k_heads, c.v_heads, c.state_dim);
+                    let ssm = if verify {
+                        d.copy(&mut s.scratch_state, 0, &s.ssm_state[*slot], 0, c.ssm_width());
+                        &mut s.scratch_state
+                    } else {
+                        &mut s.ssm_state[*slot]
+                    };
+                    d.delta_net(&mut s.att, &s.q, &s.k, &s.v, &s.ab, decay, ssm, c.k_heads, c.v_heads, c.state_dim);
                     d.rmsnorm(&mut s.att, norm, eps);
                     d.silu_mul(&mut s.z, &s.att);
                     d.hadamard(&mut s.z, signs(v_dim), false);
@@ -463,6 +478,14 @@ impl<D: Device> Model<D> {
         }
         s.parity = !s.parity;
 
+        if verify {
+            // Every token's logits.
+            s.verified = n;
+            d.norm_rotate(&mut s.xh, &s.x, &self.norm, signs(c.hidden), eps);
+            d.resize(&mut s.verify_logits, n * c.vocab);
+            d.matmul(&mut s.verify_logits, &self.lm_head, &s.xh);
+            return d.read(&s.verify_logits);
+        }
         // Only the last token's logits are wanted.
         d.resize(&mut s.xb, c.hidden);
         d.resize(&mut s.xh, c.hidden);
@@ -608,9 +631,54 @@ impl<D: Device> LanguageModel for Model<D> {
         assert!(pos + tokens.len() <= self.state.max_len, "tokens past the end of the cache");
         let mut logits = Vec::new();
         for (i, batch) in tokens.chunks(BATCH).enumerate() {
-            logits = self.forward_batch(batch, pos + i * BATCH);
+            logits = self.forward_batch(batch, pos + i * BATCH, false);
         }
         logits
+    }
+
+    fn verify(&mut self, tokens: &[u32], pos: usize) -> Option<Vec<f32>> {
+        assert!(!tokens.is_empty() && tokens.len() <= VERIFY, "a draft is one to {VERIFY} tokens");
+        assert!(pos + tokens.len() <= self.state.max_len, "tokens past the end of the cache");
+        Some(self.forward_batch(tokens, pos, true))
+    }
+
+    /// The attention layers' caches hold every token of the draft by
+    /// position and the ones past `count` are never read; the linear
+    /// layers' convolution and recurrent states, which the verify left as
+    /// they were, take the first `count` tokens' projections now.
+    fn commit(&mut self, count: usize) {
+        let c = &self.config;
+        let d = &self.device;
+        let s = &mut self.state;
+        assert!(count <= s.verified, "committing more tokens than were verified");
+        if count == 0 {
+            return;
+        }
+        let (k_dim, v_dim) = (c.k_dim(), c.v_dim());
+        let eps = c.eps;
+        d.resize(&mut s.q, count * k_dim);
+        d.resize(&mut s.k, count * k_dim);
+        d.resize(&mut s.v, count * v_dim);
+        d.resize(&mut s.att, count * v_dim);
+        for layer in &self.layers {
+            let Mixer::Linear { conv, decay, slot, .. } = &layer.mixer else {
+                continue;
+            };
+            d.resize(&mut s.stash_qkv[*slot], count * (2 * k_dim + v_dim));
+            d.resize(&mut s.stash_ab[*slot], count * 2 * c.v_heads);
+            // The parity has turned since the verify: its input buffer is
+            // the other one, and the verify's output buffer takes the
+            // state after the accepted tokens.
+            let [a, b] = &mut s.conv_state[*slot];
+            let (state, state_out) = if s.parity { (&*b, a) } else { (&*a, b) };
+            d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.stash_qkv[*slot], state, conv);
+            d.l2norm(&mut s.q, c.state_dim, eps);
+            d.l2norm(&mut s.k, c.state_dim, eps);
+            d.delta_net(&mut s.att, &s.q, &s.k, &s.v, &s.stash_ab[*slot], decay, &mut s.ssm_state[*slot], c.k_heads, c.v_heads, c.state_dim);
+            d.resize(&mut s.stash_qkv[*slot], VERIFY * (2 * k_dim + v_dim));
+            d.resize(&mut s.stash_ab[*slot], VERIFY * 2 * c.v_heads);
+        }
+        s.verified = 0;
     }
 
     fn max_len(&self) -> usize {
@@ -649,6 +717,15 @@ struct State<D: Device> {
     conv_state: Vec<[D::Buffer; 2]>,
     parity: bool,
     ssm_state: Vec<D::Buffer>,
+    /// For verifying a draft: each linear layer's projections and gates
+    /// for its tokens, a recurrent state to run on in place of the layer's
+    /// own, and room for every token's logits; and how many tokens the last
+    /// verify ran.
+    stash_qkv: Vec<D::Buffer>,
+    stash_ab: Vec<D::Buffer>,
+    scratch_state: D::Buffer,
+    verify_logits: D::Buffer,
+    verified: usize,
     rope: D::Buffer,
     max_len: usize,
 }
@@ -694,6 +771,11 @@ impl<D: Device> State<D> {
             gate_ffn: d.alloc(BATCH * c.intermediate),
             intermediate: c.intermediate,
             logits: d.alloc(c.vocab),
+            stash_qkv: (0..slots).map(|_| d.alloc(VERIFY * (2 * k_dim + v_dim))).collect(),
+            stash_ab: (0..slots).map(|_| d.alloc(VERIFY * 2 * c.v_heads)).collect(),
+            scratch_state: d.alloc(c.ssm_width()),
+            verify_logits: d.alloc(VERIFY * c.vocab),
+            verified: 0,
             k_cache: (0..caches).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
             v_cache: (0..caches).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
             conv_state: (0..slots).map(|_| [d.alloc(conv_width), d.alloc(conv_width)]).collect(),
@@ -885,6 +967,42 @@ mod tests {
     }
 
     #[test]
+    fn verifies_a_draft_and_commits_part_of_it() {
+        let dir = std::env::temp_dir().join(format!("dwim-bonsai-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path);
+        let gguf = Arc::new(Gguf::open(&path).unwrap());
+        // One model runs a draft of four tokens after a prompt and commits
+        // two; another runs the prompt and those two tokens plainly. The
+        // draft's logits are the plain ones token by token, and both
+        // models agree on the token after.
+        let mut drafted = Model::load(gguf.clone(), Cpu, 64, |_, _| {}).unwrap();
+        let mut plain = Model::load(gguf, Cpu, 64, |_, _| {}).unwrap();
+        let prompt = [3, 17, 42, 7, 9];
+        drafted.forward(&prompt, 0);
+        plain.forward(&prompt, 0);
+        let draft = [11, 2, 30, 5];
+        let logits = drafted.verify(&draft, 5).unwrap();
+        let vocab = logits.len() / draft.len();
+        for (i, &token) in draft.iter().enumerate() {
+            let want = plain.forward(&[token], 5 + i);
+            for (a, b) in logits[i * vocab..][..vocab].iter().zip(&want) {
+                assert!((a - b).abs() <= 1e-5 * (1.0 + a.abs()), "token {i}: {a} vs {b}");
+            }
+        }
+        drafted.commit(2);
+        let mut plain = Model::load(Arc::new(Gguf::open(&path).unwrap()), Cpu, 64, |_, _| {}).unwrap();
+        plain.forward(&prompt, 0);
+        plain.forward(&draft[..2], 5);
+        let (a, b) = (drafted.forward(&[8], 7), plain.forward(&[8], 7));
+        for (a, b) in a.iter().zip(&b) {
+            assert!((a - b).abs() <= 1e-5 * (1.0 + a.abs()), "{a} vs {b}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn gpu_agrees_with_cpu() {
         let dir = std::env::temp_dir().join(format!("dwim-bonsai-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -896,9 +1014,9 @@ mod tests {
         assert_ne!(cpu[0], cpu[1]);
         if let Ok(gpu) = Gpu::new() {
             let gpu = run(&path, gpu);
-            // The batch of many tokens may go through the GPU's tiled
-            // matmul, which sums in half precision.
-            for ((cpu, gpu), tolerance) in cpu.iter().zip(&gpu).zip([2e-3, 2e-3, 1e-2]) {
+            // A batch of tokens goes through the GPU's half-precision
+            // matmuls, whose difference the state carries forward.
+            for ((cpu, gpu), tolerance) in cpu.iter().zip(&gpu).zip([1e-2, 1e-2, 1e-2]) {
                 for (a, b) in cpu.iter().zip(gpu) {
                     assert!((a - b).abs() <= tolerance * (1.0 + a.abs()), "{a} vs {b}");
                 }

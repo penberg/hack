@@ -3,7 +3,7 @@ use std::{ops::ControlFlow, time::Instant};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{LanguageModel, Result, Sampler, Tokenizer};
+use crate::{LanguageModel, Result, Sampler, Tokenizer, VERIFY};
 
 /// Most tokens fed to the model at once while it reads a prompt, between
 /// progress reports.
@@ -56,6 +56,12 @@ pub struct Chat<M: LanguageModel> {
     tool_response: Vec<u32>,
     tool_response_end: Vec<u32>,
     stats: Stats,
+    /// The tokens of the conversation since it started or was restored,
+    /// for drafting a reply's next tokens from: what the model is about to
+    /// write is often what it has just read or written.
+    history: Vec<u32>,
+    /// Whether to draft, which stops if the model cannot verify a draft.
+    speculate: bool,
 }
 
 /// Where a conversation's time has gone: the tokens the model read as
@@ -68,6 +74,10 @@ pub struct Stats {
     pub prompt: Tally,
     pub thought: Tally,
     pub answer: Tally,
+    /// Tokens drafted from the conversation so far, and how many of them
+    /// the model took, each one saved a forward pass.
+    pub drafted: usize,
+    pub accepted: usize,
 }
 
 /// Tokens of one kind, and the seconds the model took over them.
@@ -90,6 +100,28 @@ enum Kind {
     Prompt,
     Thought,
     Answer,
+}
+
+/// Where the next token comes from: the logits after the last, or a draft
+/// being taken up, with the logits after the token before it and after each
+/// of its tokens, and how many of them have been taken.
+enum Next {
+    Logits(Vec<f32>),
+    Draft { all: Vec<f32>, draft: Vec<u32>, at: usize },
+}
+
+impl Next {
+    /// The logits to sample the next token from, and the draft's token for
+    /// it, if there is one.
+    fn current(&mut self) -> (&mut [f32], Option<u32>) {
+        match self {
+            Next::Logits(logits) => (logits, None),
+            Next::Draft { all, draft, at } => {
+                let vocab = all.len() / (1 + draft.len());
+                (&mut all[*at * vocab..][..vocab], draft.get(*at).copied())
+            }
+        }
+    }
 }
 
 /// A piece of the model's reply, as it is generated.
@@ -162,6 +194,8 @@ impl<M: LanguageModel> Chat<M> {
             sampler,
             len: 0,
             stats: Stats::default(),
+            history: Vec::new(),
+            speculate: true,
         })
     }
 
@@ -253,13 +287,20 @@ impl<M: LanguageModel> Chat<M> {
     }
 
     /// Generates the assistant's reply to the conversation so far.
+    ///
+    /// Each token is sampled from the logits after the one before. When the
+    /// conversation so far suggests what comes next, the suggested tokens
+    /// are run through the model together with the token just sampled, as
+    /// a draft, and taken one by one for as long as the sampler would have
+    /// picked them, so that a run of tokens the model would have written
+    /// anyway costs one pass rather than one each.
     fn generate(&mut self, mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<Vec<String>> {
         // The template opens the thought for the model.
         let mut prompt = vec![self.im_start];
         prompt.extend(self.tokenizer.encode("assistant\n")?);
         prompt.push(self.think);
         prompt.extend(self.tokenizer.encode("\n")?);
-        let mut logits = self.feed(&prompt, Kind::Prompt)?;
+        let mut next = Next::Logits(self.feed(&prompt, Kind::Prompt)?);
 
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
@@ -274,12 +315,16 @@ impl<M: LanguageModel> Chat<M> {
         let mut answering = false;
         let mut interrupted = false;
         loop {
+            let (logits, drafted) = next.current();
             if answering && !replied {
                 for token in [self.im_end, self.end_of_text, self.tool_call] {
                     logits[token as usize] = f32::NEG_INFINITY;
                 }
             }
-            let mut token = self.sampler.sample(&logits);
+            let mut token = match drafted {
+                Some(draft) => self.sampler.accept(logits, draft).unwrap_or_else(|| self.sampler.sample(logits)),
+                None => self.sampler.sample(logits),
+            };
             let kind = if thinking { Kind::Thought } else { Kind::Answer };
             if token == self.im_end || token == self.end_of_text {
                 if thinking {
@@ -330,13 +375,18 @@ impl<M: LanguageModel> Chat<M> {
                     }
                 }
             };
-            // Feed the token even if the reply ends here, so that the model
+            // Run the token even if the reply ends here, so that the model
             // remembers the reply exactly as far as it was shown.
-            logits = self.feed(&[token], kind)?;
+            next = self.advance(next, token, kind)?;
             if flow.is_break() {
                 interrupted = true;
                 break;
             }
+        }
+        if let Next::Draft { at, .. } = next {
+            // The reply ended part way through a draft: what was taken of
+            // it stands.
+            self.model.commit(1 + at);
         }
 
         // End the reply the way the chat format expects, ready for the next
@@ -353,6 +403,81 @@ impl<M: LanguageModel> Chat<M> {
         Ok(if interrupted { Vec::new() } else { calls })
     }
 
+    /// Moves the model past `token`, the one just sampled, and returns what
+    /// the next comes from. Within a draft whose next token this was, the
+    /// logits after it are known already; otherwise the draft ends, what
+    /// was taken of it is committed, and the token runs through the model,
+    /// with a new draft after it if the conversation suggests one.
+    fn advance(&mut self, next: Next, token: u32, kind: Kind) -> Result<Next> {
+        match next {
+            Next::Draft { all, draft, at } if at < draft.len() && draft[at] == token => {
+                // The draft's token, taken: the logits after it are known.
+                self.len += 1;
+                self.history.push(token);
+                self.stats.accepted += 1;
+                self.tally(kind).tokens += 1;
+                if at + 1 < draft.len() {
+                    return Ok(Next::Draft { all, draft, at: at + 1 });
+                }
+                // The whole draft was taken: it is committed whole, and the
+                // logits after its last token are its last row.
+                self.model.commit(1 + draft.len());
+                let vocab = all.len() / (1 + draft.len());
+                return Ok(Next::Logits(all[draft.len() * vocab..][..vocab].to_vec()));
+            }
+            // Not the draft's token: what was taken of the draft stands.
+            Next::Draft { at, .. } => self.model.commit(1 + at),
+            Next::Logits(_) => {}
+        }
+        // The token is part of the conversation now, and what follows it
+        // may be drafted from what followed it before.
+        self.history.push(token);
+        let draft = if self.speculate { self.draft() } else { Vec::new() };
+        if !draft.is_empty() && self.len + 1 + draft.len() <= self.model.max_len() {
+            let mut batch = vec![token];
+            batch.extend(&draft);
+            let start = Instant::now();
+            if let Some(all) = self.model.verify(&batch, self.len) {
+                self.len += 1;
+                self.stats.drafted += draft.len();
+                let tally = self.tally(kind);
+                tally.tokens += 1;
+                tally.seconds += start.elapsed().as_secs_f64();
+                return Ok(Next::Draft { all, draft, at: 0 });
+            }
+            self.speculate = false;
+        }
+        self.history.pop();
+        Ok(Next::Logits(self.feed(&[token], kind)?))
+    }
+
+    /// What the conversation suggests comes next: the tokens that followed
+    /// the last time the last few tokens occurred, up to a draft's worth,
+    /// and nothing if they have not occurred before.
+    fn draft(&self) -> Vec<u32> {
+        const KEY: usize = 3;
+        let h = &self.history;
+        let n = h.len();
+        if n <= KEY {
+            return Vec::new();
+        }
+        let key = &h[n - KEY..];
+        for end in (KEY..n).rev() {
+            if &h[end - KEY..end] == key {
+                return h[end..n.min(end + VERIFY - 1)].to_vec();
+            }
+        }
+        Vec::new()
+    }
+
+    fn tally(&mut self, kind: Kind) -> &mut Tally {
+        match kind {
+            Kind::Prompt => &mut self.stats.prompt,
+            Kind::Thought => &mut self.stats.thought,
+            Kind::Answer => &mut self.stats.answer,
+        }
+    }
+
     /// Runs tokens through the model, returning the logits after the last
     /// one, and counts them and their time as `kind`.
     fn feed(&mut self, tokens: &[u32], kind: Kind) -> Result<Vec<f32>> {
@@ -361,14 +486,11 @@ impl<M: LanguageModel> Chat<M> {
         }
         let start = Instant::now();
         let logits = self.model.forward(tokens, self.len);
-        let tally = match kind {
-            Kind::Prompt => &mut self.stats.prompt,
-            Kind::Thought => &mut self.stats.thought,
-            Kind::Answer => &mut self.stats.answer,
-        };
+        let tally = self.tally(kind);
         tally.tokens += tokens.len();
         tally.seconds += start.elapsed().as_secs_f64();
         self.len += tokens.len();
+        self.history.extend_from_slice(tokens);
         Ok(logits)
     }
 }
@@ -418,6 +540,8 @@ mod tests {
         scripts: VecDeque<Vec<u32>>,
         /// What is left of the reply being said.
         saying: VecDeque<u32>,
+        /// The last draft verified, for `commit` to replay.
+        verified: Vec<u32>,
         vocab: usize,
         think: u32,
         newline: u32,
@@ -425,6 +549,26 @@ mod tests {
     }
 
     impl LanguageModel for Scripted {
+        /// Each token in turn, as `forward` would say, then back to before.
+        fn verify(&mut self, tokens: &[u32], pos: usize) -> Option<Vec<f32>> {
+            let (fed, saying) = (self.fed.clone(), self.saying.clone());
+            let mut all = Vec::new();
+            for (i, &token) in tokens.iter().enumerate() {
+                all.extend(self.forward(&[token], pos + i));
+            }
+            self.fed = fed;
+            self.saying = saying;
+            self.verified = tokens.to_vec();
+            Some(all)
+        }
+
+        fn commit(&mut self, count: usize) {
+            let pos = self.fed.len();
+            for i in 0..count {
+                self.forward(&[self.verified[i]], pos + i);
+            }
+        }
+
         fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
             assert_eq!(pos, self.fed.len(), "the conversation must only append tokens");
             self.fed.extend(tokens);
@@ -454,6 +598,7 @@ mod tests {
             fed: Vec::new(),
             scripts: scripts.iter().map(|script| tokenizer.encode_with_special(script).unwrap()).collect(),
             saying: VecDeque::new(),
+            verified: Vec::new(),
             vocab: tokenizer.vocab_size(),
             think: tokenizer.special("<think>").unwrap(),
             newline: tokenizer.encode("\n").unwrap()[0],
@@ -471,6 +616,29 @@ mod tests {
             }
             ControlFlow::Continue(())
         }
+    }
+
+    #[test]
+    fn drafts_a_reply_from_what_it_read() {
+        // The reply repeats the message, so after its first few tokens the
+        // rest is drafted from the message and taken, and the model sees
+        // the same tokens as without drafting.
+        let message = "one two three four five six seven eight nine ten eleven twelve";
+        let script = format!("Repeating.\n</think>\n\n{message}.");
+        let mut drafted = chat(&[&script]);
+        let mut reply = String::new();
+        drafted.send(message, text(&mut reply)).unwrap();
+        assert_eq!(reply.trim(), format!("{message}."));
+        let stats = drafted.stats();
+        assert!(stats.accepted >= 8, "{stats:?}");
+        assert!(stats.accepted <= stats.drafted);
+        assert_eq!(drafted.history, drafted.model.fed);
+        let mut plain = chat(&[&script]);
+        plain.speculate = false;
+        let mut reply = String::new();
+        plain.send(message, text(&mut reply)).unwrap();
+        assert_eq!(plain.model.fed, drafted.model.fed);
+        assert_eq!(plain.stats().drafted, 0);
     }
 
     #[test]

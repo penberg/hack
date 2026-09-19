@@ -219,6 +219,7 @@ impl Stats {
             tokens("prompt", &m.prompt),
             tokens("thought", &m.thought),
             tokens("answer", &m.answer),
+            row("drafted", format!("{} tokens", m.drafted), 0.0, format!("{} taken", m.accepted)),
             row("tools", format!("{} calls", self.calls), self.tool_seconds, String::new()),
             row("other", String::new(), (total.as_secs_f64() - accounted).max(0.0), String::new()),
             row("total", String::new(), total.as_secs_f64(), String::new()),
@@ -323,6 +324,8 @@ mod tests {
                 prompt: dwim_models::Tally { tokens: 1200, seconds: 15.0 },
                 thought: dwim_models::Tally { tokens: 900, seconds: 30.0 },
                 answer: dwim_models::Tally { tokens: 300, seconds: 10.0 },
+                drafted: 200,
+                accepted: 120,
             },
             calls: 2,
             tool_seconds: 0.5,
@@ -333,9 +336,10 @@ mod tests {
         assert_eq!(lines[2], "prompt    1200 tokens    15.0 s   80 tok/s");
         assert_eq!(lines[3], "thought    900 tokens    30.0 s   30 tok/s");
         assert_eq!(lines[4], "answer     300 tokens    10.0 s   30 tok/s");
-        assert_eq!(lines[5], "tools         2 calls     0.5 s");
-        assert_eq!(lines[6], "other                     1.5 s");
-        assert_eq!(lines[7], "total                    60.0 s");
+        assert_eq!(lines[5], "drafted    200 tokens     0.0 s  120 taken");
+        assert_eq!(lines[6], "tools         2 calls     0.5 s");
+        assert_eq!(lines[7], "other                     1.5 s");
+        assert_eq!(lines[8], "total                    60.0 s");
     }
 
     #[test]

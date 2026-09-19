@@ -19,8 +19,37 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
-        // The top k in one pass over the logits, kept in order: a vocabulary
-        // is a quarter of a million entries, and k is twenty.
+        let candidates = self.candidates(logits);
+        let r = self.rng.next();
+        pick(&candidates, r)
+    }
+
+    /// Takes a drafted token or not: the token itself with the probability
+    /// the sampler would have picked it, and otherwise one picked from the
+    /// rest by their probabilities, which leaves the tokens taken
+    /// distributed as `sample` would have picked them. Nothing if the draft
+    /// was the only candidate and was not taken, which cannot happen.
+    pub fn accept(&mut self, logits: &[f32], draft: u32) -> Option<u32> {
+        let candidates = self.candidates(logits);
+        let p = candidates.iter().find(|&&(token, _)| token == draft).map_or(0.0, |&(_, p)| p);
+        if p >= 1.0 || self.rng.next() < p {
+            return Some(draft);
+        }
+        let rest: Vec<(u32, f32)> = candidates.into_iter().filter(|&(token, _)| token != draft).collect();
+        let total: f32 = rest.iter().map(|&(_, p)| p).sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let r = self.rng.next() * total;
+        Some(pick(&rest, r))
+    }
+
+    /// The tokens the sampler may pick, with their probabilities, which add
+    /// up to one: the top k by logit, in one pass over the logits (a
+    /// vocabulary is a quarter of a million entries, and k is twenty), at
+    /// the temperature, cut to the most likely up to a total of top p. At
+    /// temperature zero, the top one alone.
+    fn candidates(&self, logits: &[f32]) -> Vec<(u32, f32)> {
         let k = self.top_k.clamp(1, logits.len());
         let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
         for (token, &logit) in logits.iter().enumerate() {
@@ -32,39 +61,40 @@ impl Sampler {
             candidates.truncate(k);
         }
         if self.temperature == 0.0 {
-            return candidates[0].0;
+            return vec![(candidates[0].0, 1.0)];
         }
-
         let max = candidates[0].1;
-        let mut probs: Vec<f32> = candidates
-            .iter()
-            .map(|&(_, logit)| ((logit - max) / self.temperature).exp())
-            .collect();
-        let sum: f32 = probs.iter().sum();
-        for p in &mut probs {
-            *p /= sum;
+        for (_, logit) in &mut candidates {
+            *logit = ((*logit - max) / self.temperature).exp();
         }
-
-        // Keep the most likely tokens up to a total probability of top_p.
+        let sum: f32 = candidates.iter().map(|&(_, p)| p).sum();
         let mut kept = 0.0;
         let mut n = 0;
-        while n < probs.len() && kept < self.top_p {
-            kept += probs[n];
+        while n < candidates.len() && kept < self.top_p {
+            kept += candidates[n].1 / sum;
             n += 1;
         }
-        let r = self.rng.next() * kept;
-        let mut acc = 0.0;
-        for i in 0..n {
-            acc += probs[i];
-            if r < acc {
-                return candidates[i].0;
-            }
+        candidates.truncate(n);
+        for (_, p) in &mut candidates {
+            *p /= sum * kept;
         }
-        candidates[n - 1].0
+        candidates
     }
 }
 
 /// xorshift64*, uniform in [0, 1).
+/// The candidate at `r` in [0, 1) along their probabilities.
+fn pick(candidates: &[(u32, f32)], r: f32) -> u32 {
+    let mut acc = 0.0;
+    for &(token, p) in candidates {
+        acc += p;
+        if r < acc {
+            return token;
+        }
+    }
+    candidates[candidates.len() - 1].0
+}
+
 struct Rng(u64);
 
 impl Rng {
