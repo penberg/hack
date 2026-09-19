@@ -35,8 +35,11 @@ const TERNARY_TILE_TOKENS: usize = 64;
 /// Workgroup memory the tile kernel takes: the rows' and the tokens' block
 /// as half floats.
 const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS + TERNARY_TILE_TOKENS) * 2 * 128;
-/// Most words of packed activations a batch through the tile kernel has,
-/// two tokens to a word: the size of the buffer they are packed into.
+/// Most tokens the kernel for a few tokens takes at once.
+const TERNARY_FEW_TOKENS: usize = 8;
+/// Most words of packed activations a batch through the tile kernel or the
+/// kernel for a few tokens has, two tokens to a word: the size of the
+/// buffer they are packed into.
 const PACKED: usize = 1 << 20;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
@@ -78,6 +81,7 @@ struct Kernels {
     matmul_ternary: vk::Pipeline,
     matmul_ternary_batch: vk::Pipeline,
     matmul_ternary_tile: vk::Pipeline,
+    matmul_ternary_few: vk::Pipeline,
     pack_halves: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
@@ -95,12 +99,13 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn all(&self) -> [vk::Pipeline; 18] {
+    fn all(&self) -> [vk::Pipeline; 19] {
         [
             self.matmul,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
+            self.matmul_ternary_few,
             self.pack_halves,
             self.add,
             self.rmsnorm,
@@ -304,6 +309,7 @@ impl Vulkan {
                 matmul_ternary: spv!("matmul_ternary"),
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
+                matmul_ternary_few: spv!("matmul_ternary_few"),
                 pack_halves: spv!("pack_halves"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
@@ -814,12 +820,14 @@ impl Device for Vulkan {
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
-        // A batch of many tokens through ternary weights is a tiled matrix
-        // product over the activations packed as half floats: a workgroup
-        // per tile of rows and tokens, the row tiles across the grid and
-        // down it as wide as the GPU allows, and each row of the grid
-        // repeated for every tile of tokens.
-        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
+        // A batch of tokens through ternary weights multiplies the
+        // activations packed as half floats: a few tokens by the kernel
+        // that reads the weights once for up to eight, and many as a tiled
+        // matrix product, a workgroup per tile of rows and tokens, the row
+        // tiles across the grid and down it as wide as the GPU allows, and
+        // each row of the grid repeated for every tile of tokens.
+        let few = w.ternary && (2..=TERNARY_FEW_TOKENS).contains(&n);
+        if few || (w.ternary && n >= TERNARY_TILE_TOKENS / 2) {
             let pairs = n.div_ceil(2).next_multiple_of(4);
             assert!(pairs * cols <= PACKED, "a batch of {n} tokens of {cols} is more than the tile kernel packs");
             let params = PackParams {
@@ -828,6 +836,20 @@ impl Device for Vulkan {
             };
             let groups = (cols.div_ceil(256) as u32, pairs as u32);
             self.dispatch(self.kernels.pack_halves, &[self.packed, x.buf], &params, groups);
+        }
+        if few {
+            let count = rows.div_ceil(TERNARY_ROWS);
+            let width = count.min(self.max_groups as usize);
+            let params = MatmulParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                n: n as u32,
+                stride: width as u32,
+            };
+            self.dispatch(self.kernels.matmul_ternary_few, &[out.buf, w.buf, self.packed], &params, (width as u32, count.div_ceil(width) as u32));
+            return;
+        }
+        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
             let count = rows.div_ceil(TERNARY_TILE_ROWS);
             let width = count.min(self.max_groups as usize);
             let height = count.div_ceil(width) * n.div_ceil(TERNARY_TILE_TOKENS);

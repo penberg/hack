@@ -149,12 +149,12 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(14);
     // Single tokens, small batches, and batches of half a tile of tokens or
     // more at the edges of the tiles: a whole one, partial row and token
-    // tiles, and the model's width. A device may multiply a batch of that
-    // size in half precision, as the Vulkan tile kernel does, so a batch is
-    // held to an error of a thousandth of the outputs' typical magnitude in
-    // root mean square and a hundredth at worst, which is a tenth of what
-    // eight-bit activations would cost; a single token to the usual.
-    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2), (64, 128, 16), (100, 256, 47), (1030, 1152, 33), (300, 1152, 130), (2500, 5120, 64)] {
+    // tiles, and the model's width. A device may multiply a batch in half
+    // precision, as the Vulkan batch kernels do, so a batch is held to an
+    // error of a thousandth of the outputs' typical magnitude in root mean
+    // square and a hundredth at worst, which is a tenth of what eight-bit
+    // activations would cost; a single token to the usual.
+    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2), (200, 5120, 8), (64, 128, 16), (100, 256, 47), (1030, 1152, 33), (300, 1152, 130), (2500, 5120, 64)] {
         let w = rng.ternary(&[rows, cols]);
         let x = rng.floats(n * cols);
         let mut want = vec![0.0; n * rows];
@@ -163,7 +163,7 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
         let mut out = gpu.alloc(n * rows);
         gpu.matmul(&mut out, &weight, &buffer(gpu, &x));
         let got = gpu.read(&out);
-        if n >= 32 {
+        if n >= 2 {
             let typical = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
             let (mut worst, mut sum) = (0.0f64, 0.0f64);
             for (g, w) in got.iter().zip(&want) {
