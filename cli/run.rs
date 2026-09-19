@@ -132,6 +132,9 @@ enum Reply {
     Output(String),
     /// The reply is over, and where the conversation's time has gone.
     Done(harness::Stats),
+    /// The turn failed, though the model is still there for the next one.
+    Error(String),
+    /// The model is gone: it could not be fetched or loaded.
     Failed(String),
 }
 
@@ -199,7 +202,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     let _ = replies.send(Reply::Ready);
 
     for message in requests {
-        harness.send(&message, |event| {
+        let result = harness.send(&message, |event| {
             let reply = match event {
                 harness::Event::Thought(text) => Reply::Thought(text.to_string()),
                 harness::Event::Text(text) => Reply::Text(text.to_string()),
@@ -215,7 +218,10 @@ fn serve<D: dwim_gpu::Device + 'static>(
             } else {
                 ControlFlow::Continue(())
             }
-        })?;
+        });
+        if let Err(e) = result {
+            let _ = replies.send(Reply::Error(e.to_string()));
+        }
         let _ = replies.send(Reply::Done(harness.stats()));
     }
     Ok(())
@@ -522,6 +528,12 @@ impl App {
                     self.lines.push(vec![span("  ⎿ Interrupted").dark_grey()]);
                 }
                 self.status = Status::Idle;
+            }
+            Reply::Error(e) => {
+                self.finish();
+                self.lines
+                    .push(vec![span("● ").red(), span(format!("error: {e}"))]);
+                self.lines.push(Line::new());
             }
             Reply::Failed(e) => return Err(e.into()),
         }
