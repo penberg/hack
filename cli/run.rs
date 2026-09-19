@@ -101,6 +101,14 @@ pub fn run(
     result
 }
 
+/// What the shell asks of the model thread.
+enum Request {
+    /// A message from the user.
+    Message(String),
+    /// Compact the conversation now, as the `/compact` command asks.
+    Compact,
+}
+
 /// What the model thread reports back.
 enum Reply {
     /// Part of one of the model's files has been downloaded.
@@ -141,6 +149,8 @@ enum Reply {
         before: usize,
         after: usize,
     },
+    /// Something to tell the user, in place of a reply.
+    Notice(String),
     /// The reply is over, and where the conversation's time has gone.
     Done(harness::Stats),
     /// The turn failed, though the model is still there for the next one.
@@ -156,7 +166,7 @@ fn work(
     dir: &Path,
     device: Device,
     context: usize,
-    requests: Receiver<String>,
+    requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
@@ -190,7 +200,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     device: D,
     which: &'static models::Model,
     context: usize,
-    requests: Receiver<String>,
+    requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
@@ -210,15 +220,23 @@ fn serve<D: dwim_gpu::Device + 'static>(
     })?;
     let _ = replies.send(Reply::Ready);
 
-    for message in requests {
-        let result = harness.send(&message, |event| {
+    for request in requests {
+        let on_event = |event: harness::Event| {
             let _ = replies.send(reply(event));
             if stop.load(Ordering::Relaxed) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
             }
-        });
+        };
+        let result = match request {
+            Request::Message(message) => harness.send(&message, on_event),
+            Request::Compact => harness.compact(on_event).map(|compacted| {
+                if !compacted && !stop.load(Ordering::Relaxed) {
+                    let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
+                }
+            }),
+        };
         if let Err(e) = result {
             let _ = replies.send(Reply::Error(e.to_string()));
         }
@@ -314,7 +332,7 @@ struct App {
     thinking: bool,
     /// Lines waiting to be printed above the live region.
     lines: Vec<Line>,
-    requests: Sender<String>,
+    requests: Sender<Request>,
     replies: Receiver<Reply>,
     stop: Arc<AtomicBool>,
 }
@@ -463,10 +481,14 @@ impl App {
         }
         self.lines.push(Line::new());
 
-        if let Some(command) = message.strip_prefix('/') {
-            self.command(command);
-            return;
-        }
+        let request = match message.strip_prefix('/') {
+            Some("compact") => Request::Compact,
+            Some(command) => {
+                self.command(command);
+                return;
+            }
+            None => Request::Message(message),
+        };
 
         self.reply.clear();
         self.segment = Segment::Text;
@@ -475,7 +497,7 @@ impl App {
         self.interrupted = false;
         self.stop.store(false, Ordering::Relaxed);
         self.status = Status::Reading(Instant::now());
-        let _ = self.requests.send(message);
+        let _ = self.requests.send(request);
     }
 
     fn reply(&mut self, reply: Reply) -> Result<(), Box<dyn Error>> {
@@ -571,6 +593,11 @@ impl App {
                     self.lines.push(vec![span("  ⎿ Interrupted").dark_grey()]);
                 }
                 self.status = Status::Idle;
+            }
+            Reply::Notice(text) => {
+                self.finish();
+                self.lines.push(vec![span(format!("● {text}")).dark_grey()]);
+                self.lines.push(Line::new());
             }
             Reply::Error(e) => {
                 self.finish();

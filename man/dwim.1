@@ -37,6 +37,13 @@ Device to run the model on:
 Maximum conversation length in tokens (default: 32768).
 Cannot exceed the model's supported context length.
 Larger values reserve more memory on the selected device at startup.
+The conversation is compacted before it outgrows the window: when a
+message or a command's output would take it past four fifths, the agent
+writes itself a note of the task, what it found, what it did and what is
+next, starts over from the system prompt, and reads back the note, your
+earlier messages, and the most recent exchanges without their thoughts.
+A reply that runs out of room is stopped short and goes on after a
+compaction.
 .TP
 .B \-\-stats
 When answering a prompt given on the command line, print where the time
@@ -69,6 +76,10 @@ marking the one running.
 Show where the conversation's time has gone, as
 .B \-\-stats
 does.
+.TP
+.B /compact
+Compact the conversation now, as happens on its own when it nears the
+end of the context window.
 .PP
 The model thinks before it replies, and the shell hides the thought unless
 .B Ctrl\-O
