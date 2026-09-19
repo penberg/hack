@@ -70,7 +70,7 @@ pub fn once(
 fn answer<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
-    which: &models::Model,
+    which: &'static models::Model,
     on: &str,
     context: usize,
     prompt: &str,
@@ -86,17 +86,15 @@ fn answer<D: dwim_gpu::Device + 'static>(
     let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
-    models::start(
-        &mut chat,
-        which,
-        &harness::system_prompt(&cwd),
-        |read, total| {
-            progress.report("reading the system prompt".to_string(), read, total);
-        },
-    )?;
+    let system = harness::system_prompt(&cwd);
+    models::start(&mut chat, which, &system, |read, total| {
+        progress.report("reading the system prompt".to_string(), read, total);
+    })?;
 
     let mut printer = Printer::default();
-    let mut harness = Harness::new(chat, &cwd);
+    let mut harness = Harness::new(chat, &cwd, move |chat| {
+        models::start(chat, which, &system, |_, _| {}).map(|_| ())
+    })?;
     harness.send(prompt, |event| {
         printer.print(event);
         ControlFlow::Continue(())
@@ -189,6 +187,19 @@ impl Printer {
                 }
             }
             harness::Event::Output(output) => eprintln!("{output}"),
+            harness::Event::Cut => {
+                self.end_thought();
+                eprintln!("[stopped short: the context window is full]");
+            }
+            harness::Event::Compacting => {
+                self.end_thought();
+                eprintln!("[compacting the conversation]");
+            }
+            harness::Event::Note(text) => self.print(harness::Event::Thought(text)),
+            harness::Event::Compacted { before, after } => {
+                self.end_thought();
+                eprintln!("[compacted from {before} to {after} tokens]");
+            }
         }
     }
 

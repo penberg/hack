@@ -12,14 +12,18 @@ use serde_json::Value;
 
 use crate::string;
 
-/// Lines in a page.
+/// Most lines in a page.
 pub const PAGE: usize = 200;
+
+/// Most bytes in a page: a page of long lines ends early, so that one
+/// page can't take up much of the context.
+pub const BYTES: usize = 16 << 10;
 
 /// Most bytes of a line shown; a longer line is cut there, with a mark.
 pub const LINE: usize = 300;
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "read", "description": "Read a file, a page of 200 numbered lines at a time. The result says how many lines the file has and where the next page starts.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to read."}, "start": {"type": "integer", "description": "The line to start from, counting from 1. The first line if left out."}}, "required": ["path"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "read", "description": "Read a file, a page of up to 200 numbered lines (or 16 KB) at a time. The result says how many lines the file has and where the next page starts.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to read."}, "start": {"type": "integer", "description": "The line to start from, counting from 1. The first line if left out."}}, "required": ["path"]}}}"#;
 
 /// Reads the page of the file in `arguments`, returning what the model
 /// should see.
@@ -58,8 +62,8 @@ pub fn start(arguments: &Value) -> Option<u64> {
 }
 
 /// The page of `file` from line `start`: its lines, each after its number
-/// and a tab, then a line of where the page sits in the file and where the
-/// next page starts.
+/// and a tab, up to [`PAGE`] of them or [`BYTES`] in all, then a line of
+/// where the page sits in the file and where the next page starts.
 fn page(mut file: impl BufRead, path: &str, start: u64) -> io::Result<String> {
     let mut text = String::new();
     let mut line = Vec::new();
@@ -74,25 +78,27 @@ fn page(mut file: impl BufRead, path: &str, start: u64) -> io::Result<String> {
         if lines < start {
             continue;
         }
-        if shown == PAGE {
-            // The file goes on past the page: count the rest.
-            lines += count(&mut file)?;
-            break;
-        }
         let mut content = line.strip_suffix(b"\n").unwrap_or(&line);
         content = content.strip_suffix(b"\r").unwrap_or(content);
         let mut content = String::from_utf8_lossy(content).into_owned();
-        if content.len() > LINE {
+        let long = content.len() > LINE;
+        if long {
             let end = (0..=LINE)
                 .rev()
                 .find(|&i| content.is_char_boundary(i))
                 .unwrap_or(0);
             content.truncate(end);
             content.push('…');
-            cut += 1;
         }
-        text.push_str(&format!("{lines}\t{content}\n"));
+        let entry = format!("{lines}\t{content}\n");
+        if shown == PAGE || (shown > 0 && text.len() + entry.len() > BYTES) {
+            // The file goes on past the page: count the rest.
+            lines += count(&mut file)?;
+            break;
+        }
+        text.push_str(&entry);
         shown += 1;
+        cut += u64::from(long);
     }
     let end = start + shown as u64 - 1;
     let mut note = if lines == 0 {
@@ -280,6 +286,52 @@ mod tests {
             )),
             "{page}"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ends_a_page_of_long_lines_early() {
+        // 100 lines of 299 bytes: three pages by bytes, half of one by lines.
+        let text: String = (1..=100).map(|i| format!("{i:<299}\n")).collect();
+        let (dir, path) = file("wide.txt", &text);
+        let mut start = 1;
+        let mut seen = Vec::new();
+        while start <= 100 {
+            let page = read(&path, Some(start));
+            let body: usize = page
+                .lines()
+                .filter(|line| !line.starts_with('['))
+                .map(|line| line.len() + 1)
+                .sum();
+            assert!(body <= BYTES, "{body} bytes of lines");
+            let shown: Vec<u64> = page
+                .lines()
+                .filter(|line| !line.starts_with('['))
+                .map(|line| line.split('\t').next().unwrap().parse().unwrap())
+                .collect();
+            assert!(!shown.is_empty());
+            let end = *shown.last().unwrap();
+            if end < 100 {
+                assert!(
+                    page.ends_with(&format!(
+                        "[lines {start}–{end} of 100 in {path}; next: read {path} from line {}]",
+                        end + 1
+                    )),
+                    "{page}"
+                );
+            } else {
+                assert!(
+                    page.ends_with(&format!(
+                        "[lines {start}–100 of 100 in {path}; end of file]"
+                    )),
+                    "{page}"
+                );
+            }
+            seen.extend(shown);
+            start = end + 1;
+        }
+        assert_eq!(seen, (1..=100).collect::<Vec<_>>());
+        assert!(seen.len() > 1);
         fs::remove_dir_all(dir).unwrap();
     }
 

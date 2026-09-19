@@ -735,6 +735,20 @@ impl<D: Device> LanguageModel for Model<D> {
         logits
     }
 
+    /// Zeroes the linear layers' states, as they were before any token.
+    /// The attention layers' caches need no clearing: attention reads only
+    /// the positions before the token's.
+    fn reset(&mut self) {
+        let (c, d, s) = (&self.config, &self.device, &mut self.state);
+        for slot in 0..s.ssm_state.len() {
+            for conv in &mut s.conv_state[slot] {
+                d.write(conv, &vec![0.0; c.conv_width()]);
+            }
+            d.write(&mut s.ssm_state[slot], &vec![0.0; c.ssm_width()]);
+        }
+        s.parity = false;
+    }
+
     fn max_len(&self) -> usize {
         self.state.max_len
     }
@@ -1115,10 +1129,20 @@ mod tests {
         whole.forward(&[3, 17, 42, 7, 9], 0);
         let state = whole.save(5).unwrap();
         let want = whole.forward(&[11, 2], 5);
-        let mut resumed = Model::load(gguf, Cpu, 64, |_, _| {}).unwrap();
+        let mut resumed = Model::load(gguf.clone(), Cpu, 64, |_, _| {}).unwrap();
         assert_eq!(resumed.restore(&state).unwrap(), 5);
         assert_eq!(resumed.forward(&[11, 2], 5), want);
         assert!(resumed.restore(&state[..100]).is_err());
+
+        // Reset, the model is as it was when loaded: the same logits for
+        // the same tokens from the start, after a conversation that left
+        // the linear layers' states behind.
+        let fresh = Model::load(gguf, Cpu, 64, |_, _| {})
+            .unwrap()
+            .forward(&[3, 17, 42, 7, 9], 0);
+        assert_ne!(whole.forward(&[3, 17, 42, 7, 9], 7), fresh);
+        whole.reset();
+        assert_eq!(whole.forward(&[3, 17, 42, 7, 9], 0), fresh);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

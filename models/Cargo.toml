@@ -15,3 +15,7 @@ serde_json = "1.0.151"
 
 [dev-dependencies]
 dirs = "7.0.0"
+
+[features]
+# The scripted model and the tiny tokenizer, for other crates' tests.
+testing = []

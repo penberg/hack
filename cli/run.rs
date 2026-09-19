@@ -101,6 +101,14 @@ pub fn run(
     result
 }
 
+/// What the shell asks of the model thread.
+enum Request {
+    /// A message from the user.
+    Message(String),
+    /// Compact the conversation now, as the `/compact` command asks.
+    Compact,
+}
+
 /// What the model thread reports back.
 enum Reply {
     /// Part of one of the model's files has been downloaded.
@@ -130,8 +138,24 @@ enum Reply {
     },
     /// What the tool returned.
     Output(String),
+    /// The reply was stopped short because the context window was full.
+    Cut,
+    /// The conversation is being compacted: the model's note to go on
+    /// from follows, in pieces.
+    Compacting,
+    Note(String),
+    /// The conversation was compacted: from how many tokens, to how many.
+    Compacted {
+        before: usize,
+        after: usize,
+    },
+    /// Something to tell the user, in place of a reply.
+    Notice(String),
     /// The reply is over, and where the conversation's time has gone.
     Done(harness::Stats),
+    /// The turn failed, though the model is still there for the next one.
+    Error(String),
+    /// The model is gone: it could not be fetched or loaded.
     Failed(String),
 }
 
@@ -142,7 +166,7 @@ fn work(
     dir: &Path,
     device: Device,
     context: usize,
-    requests: Receiver<String>,
+    requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
@@ -174,9 +198,9 @@ fn work(
 fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
-    which: &models::Model,
+    which: &'static models::Model,
     context: usize,
-    requests: Receiver<String>,
+    requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
@@ -187,38 +211,55 @@ fn serve<D: dwim_gpu::Device + 'static>(
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
-    models::start(
-        &mut chat,
-        which,
-        &harness::system_prompt(&cwd),
-        |read, total| {
-            let _ = replies.send(Reply::Prompting { read, total });
-        },
-    )?;
-    let mut harness = Harness::new(chat, &cwd);
+    let system = harness::system_prompt(&cwd);
+    models::start(&mut chat, which, &system, |read, total| {
+        let _ = replies.send(Reply::Prompting { read, total });
+    })?;
+    let mut harness = Harness::new(chat, &cwd, move |chat| {
+        models::start(chat, which, &system, |_, _| {}).map(|_| ())
+    })?;
     let _ = replies.send(Reply::Ready);
 
-    for message in requests {
-        harness.send(&message, |event| {
-            let reply = match event {
-                harness::Event::Thought(text) => Reply::Thought(text.to_string()),
-                harness::Event::Text(text) => Reply::Text(text.to_string()),
-                harness::Event::Call { name, detail } => Reply::Call {
-                    name: name.to_string(),
-                    detail: detail.to_string(),
-                },
-                harness::Event::Output(output) => Reply::Output(output.to_string()),
-            };
-            let _ = replies.send(reply);
+    for request in requests {
+        let on_event = |event: harness::Event| {
+            let _ = replies.send(reply(event));
             if stop.load(Ordering::Relaxed) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
             }
-        })?;
+        };
+        let result = match request {
+            Request::Message(message) => harness.send(&message, on_event),
+            Request::Compact => harness.compact(on_event).map(|compacted| {
+                if !compacted && !stop.load(Ordering::Relaxed) {
+                    let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
+                }
+            }),
+        };
+        if let Err(e) = result {
+            let _ = replies.send(Reply::Error(e.to_string()));
+        }
         let _ = replies.send(Reply::Done(harness.stats()));
     }
     Ok(())
+}
+
+/// What the model thread reports for an event of a turn.
+fn reply(event: harness::Event) -> Reply {
+    match event {
+        harness::Event::Thought(text) => Reply::Thought(text.to_string()),
+        harness::Event::Text(text) => Reply::Text(text.to_string()),
+        harness::Event::Call { name, detail } => Reply::Call {
+            name: name.to_string(),
+            detail: detail.to_string(),
+        },
+        harness::Event::Output(output) => Reply::Output(output.to_string()),
+        harness::Event::Cut => Reply::Cut,
+        harness::Event::Compacting => Reply::Compacting,
+        harness::Event::Note(text) => Reply::Note(text.to_string()),
+        harness::Event::Compacted { before, after } => Reply::Compacted { before, after },
+    }
 }
 
 /// What the model is doing.
@@ -258,6 +299,8 @@ enum Segment {
     Thought,
     /// The reply itself.
     Text,
+    /// The note the model goes on from after the conversation is compacted.
+    Note,
 }
 
 struct App {
@@ -289,7 +332,7 @@ struct App {
     thinking: bool,
     /// Lines waiting to be printed above the live region.
     lines: Vec<Line>,
-    requests: Sender<String>,
+    requests: Sender<Request>,
     replies: Receiver<Reply>,
     stop: Arc<AtomicBool>,
 }
@@ -438,10 +481,14 @@ impl App {
         }
         self.lines.push(Line::new());
 
-        if let Some(command) = message.strip_prefix('/') {
-            self.command(command);
-            return;
-        }
+        let request = match message.strip_prefix('/') {
+            Some("compact") => Request::Compact,
+            Some(command) => {
+                self.command(command);
+                return;
+            }
+            None => Request::Message(message),
+        };
 
         self.reply.clear();
         self.segment = Segment::Text;
@@ -450,7 +497,7 @@ impl App {
         self.interrupted = false;
         self.stop.store(false, Ordering::Relaxed);
         self.status = Status::Reading(Instant::now());
-        let _ = self.requests.send(message);
+        let _ = self.requests.send(request);
     }
 
     fn reply(&mut self, reply: Reply) -> Result<(), Box<dyn Error>> {
@@ -514,6 +561,30 @@ impl App {
                 }
                 self.lines.push(Line::new());
             }
+            Reply::Cut => {
+                self.finish();
+                self.lines.push(vec![
+                    span("  ⎿ Stopped short: the context window is full").dark_grey(),
+                ]);
+                self.lines.push(Line::new());
+            }
+            Reply::Compacting => {
+                self.finish();
+                self.lines.push(vec![
+                    span("● ").dark_grey(),
+                    span("Compacting the conversation…").dark_grey(),
+                ]);
+                self.status = Status::Reading(Instant::now());
+            }
+            Reply::Note(text) => self.generated(Segment::Note, &text),
+            Reply::Compacted { before, after } => {
+                self.finish();
+                self.lines.push(vec![
+                    span(format!("  ⎿ Compacted from {before} to {after} tokens")).dark_grey(),
+                ]);
+                self.lines.push(Line::new());
+                self.status = Status::Reading(Instant::now());
+            }
             Reply::Done(stats) => {
                 self.stats = stats;
                 self.reply.truncate(self.reply.trim_end().len());
@@ -522,6 +593,17 @@ impl App {
                     self.lines.push(vec![span("  ⎿ Interrupted").dark_grey()]);
                 }
                 self.status = Status::Idle;
+            }
+            Reply::Notice(text) => {
+                self.finish();
+                self.lines.push(vec![span(format!("● {text}")).dark_grey()]);
+                self.lines.push(Line::new());
+            }
+            Reply::Error(e) => {
+                self.finish();
+                self.lines
+                    .push(vec![span("● ").red(), span(format!("error: {e}"))]);
+                self.lines.push(Line::new());
             }
             Reply::Failed(e) => return Err(e.into()),
         }
@@ -711,6 +793,7 @@ impl App {
                 match self.segment {
                     Segment::Thought => "Thinking…".to_string(),
                     Segment::Text => "Generating…".to_string(),
+                    Segment::Note => "Compacting…".to_string(),
                 },
                 start,
                 format!(
@@ -719,7 +802,7 @@ impl App {
                     match (self.segment, self.thinking) {
                         (Segment::Thought, false) => "ctrl+o to show · ",
                         (Segment::Thought, true) => "ctrl+o to hide · ",
-                        (Segment::Text, _) => "",
+                        (Segment::Text | Segment::Note, _) => "",
                     }
                 ),
             ),
@@ -811,10 +894,11 @@ fn models_listing(running: &str) -> Vec<Line> {
 }
 
 /// A line of a part of the reply, the first one marked with a bullet. A
-/// thought is dimmed, so the reply stands out from it.
+/// thought is dimmed, so the reply stands out from it, and so is the note
+/// the model goes on from after a compaction.
 fn reply_line(segment: Segment, (i, text): (usize, &str)) -> Line {
     match segment {
-        Segment::Thought => {
+        Segment::Thought | Segment::Note => {
             let bullet = if i == 0 { span("✻ ") } else { span("  ") };
             vec![bullet.dark_grey(), span(text).dark_grey().italic()]
         }
