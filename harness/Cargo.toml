@@ -9,3 +9,6 @@ path = "lib.rs"
 [dependencies]
 dwim-models.workspace = true
 dwim-tools.workspace = true
+
+[dev-dependencies]
+dwim-models = { workspace = true, features = ["testing"] }
